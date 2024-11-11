@@ -4,13 +4,13 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui, modified_render
 import sys
-from scene import Scene, GaussianModel
+from scene import Scene, GaussianModel4D
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
+from arguments import ModelParams, PipelineParams, OptimizationParams, ModelHiddenParams
 from active.schema import schema_dict
 from utils.loss_utils import ssim
 from lpipsPyTorch import lpips, lpips_func
@@ -50,24 +50,30 @@ def load_checkpoint(ckpt_path: str, gaussians, scene, opt, ignore_train_idxs=Fal
     return first_iter, base_iter
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
+def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
     first_iter = 0
     base_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree)
+
+    # Use Gaussian Model from 4D Gaussian
+    gaussians = GaussianModel4D(dataset.sh_degree, hyper)
+
+    # Use Scene from Fisher RF
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     
     # Active View Selection
     schema = schema_dict[args.schema](dataset_size=len(scene.getTrainCameras()), scene=scene)
     print(f"schema: {schema.load_its}")
-    scene.train_idxs = schema.init_views
+
+    # scene.train_idxs = schema.init_views
 
     active_method = methods_dict[args.method](args)
 
     init_ckpt_path = f"{args.model_path}/init.ckpt"
     if checkpoint: # this is to continue training in SLURM after requeue
         if os.path.exists(checkpoint):
+            # Check this for 4D Gaussian
             first_iter, base_iter = load_checkpoint(checkpoint, gaussians, scene, opt)
         else:
             print(f"[WARNING] checkpoint {checkpoint} doesn't exist, training from scratch")
@@ -93,6 +99,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
+                    # Use FisherRF render
                     net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
@@ -101,7 +108,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             except Exception as e:
                 network_gui.conn = None
 
-        num_views = schema.num_views_to_add(iteration)
+        # num_views = schema.num_views_to_add(iteration)
+        num_views = 0
         if num_views > 0:
             try:
                 # For sectioned training
@@ -122,8 +130,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print(f"ITER {iteration}: training views after selection: {scene.train_idxs}")
 
             gaussians.optimizer.zero_grad(set_to_none = True)
-
             first_iter, _ = load_checkpoint(init_ckpt_path, gaussians, scene, opt, ignore_train_idxs=True)
+            print("Loaded From Init checkpoint, gaussians state_dict: ",  gaussians._deformation.deformation_net.grid.grids)
             base_iter = iteration - 1
 
         iter_start.record()
@@ -171,9 +179,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), 
                             testing_iterations, scene, render, (pipe, background), before_selection=before_selection, 
                             log_every_image=args.log_every_image)
+
+            stage = "coarse" # Only use fine for now until I figure out how to get the coarse and fine to interface with FisherRF
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
+                print("Saving Gaussians:  ",  gaussians._deformation.deformation_net.grid.grids)
+                scene.save(iteration, stage)
 
             # Densification
             cur_iter = iteration - base_iter
@@ -182,12 +193,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if cur_iter > opt.densify_from_iter and cur_iter % opt.densification_interval == 0:
+                if stage == "coarse":
+                    opacity_threshold = opt.opacity_threshold_coarse
+                    densify_threshold = opt.densify_grad_threshold_coarse
+                else:    
+                    opacity_threshold = opt.opacity_threshold_fine_init - cur_iter*(opt.opacity_threshold_fine_init - opt.opacity_threshold_fine_after)/(opt.densify_until_iter)  
+                    densify_threshold = opt.densify_grad_threshold_fine_init - cur_iter*(opt.densify_grad_threshold_fine_init - opt.densify_grad_threshold_after)/(opt.densify_until_iter )  
+                if  cur_iter > opt.densify_from_iter and cur_iter % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<360000:
                     size_threshold = 20 if cur_iter > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, args.min_opacity, scene.cameras_extent, size_threshold)
-                
-                if cur_iter % opt.opacity_reset_interval == 0 or (dataset.white_background and cur_iter == opt.densify_from_iter):
-                    print(f"\nreset_opacity at {cur_iter}, base_iter")
+                    
+                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, 5, 5, scene.model_path, cur_iter, stage)
+                if  cur_iter > opt.pruning_from_iter and cur_iter % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>200000:
+                    size_threshold = 20 if cur_iter > opt.opacity_reset_interval else None
+
+                    gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
+                    
+                # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
+                if cur_iter % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<360000 and opt.add_point:
+                    gaussians.grow(5,5,scene.model_path,cur_iter,stage)
+                    # torch.cuda.empty_cache()
+                if cur_iter % opt.opacity_reset_interval == 0:
+                    print("reset opacity")
                     gaussians.reset_opacity()
 
             # Optimizer step
@@ -196,6 +222,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.optimizer.zero_grad(set_to_none = True)
         
         if (iteration in checkpoint_iterations):
+            print("Saving: ", gaussians._deformation.grid.grids)
             save_checkpoint(gaussians, iteration, scene)
     wandb.finish()
 
@@ -279,7 +306,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 wandb.log(log_dict, step=iteration)
 
         if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            # tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
             wandb.log({'total_points': scene.gaussians.get_xyz.shape[0]}, step=iteration)
         torch.cuda.empty_cache()
@@ -296,9 +323,12 @@ def find_free_port():
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
+
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
+    hp = ModelHiddenParams(parser)
+
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
@@ -322,6 +352,9 @@ if __name__ == "__main__":
     parser.add_argument("--log_every_image", action="store_true", help="log every images during traing")
     parser.add_argument("--override_idxs", default=None, type=str, help="speical test idxs on uncertainty evaluation")
 
+    # From 4D Gaussians
+    parser.add_argument("--configs", type=str, default = "")
+
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     if args.log_every_image:
@@ -331,6 +364,13 @@ if __name__ == "__main__":
     
     if args.start_checkpoint is None:
         args.start_checkpoint = args.model_path + "/last.pth"
+    
+    # From 4D Gaussians
+    if args.configs:
+        import mmcv
+        from utils.params_utils import merge_hparams
+        config = mmcv.Config.fromfile(args.configs)
+        args = merge_hparams(args, config)
 
     print("Optimizing " + args.model_path)
 
@@ -347,7 +387,7 @@ if __name__ == "__main__":
 
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,
+    training(lp.extract(args), hp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,
              args)
 
     # All done

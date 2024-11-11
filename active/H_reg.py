@@ -6,6 +6,7 @@ from copy import deepcopy
 import random
 from gaussian_renderer import render, network_gui, modified_render
 from scene import Scene
+from collections import OrderedDict
 
 
 class HRegSelector(torch.nn.Module):
@@ -30,11 +31,20 @@ class HRegSelector(torch.nn.Module):
             viewpoint_cams = scene.getTestCameras()
 
         params = gaussians.capture()[1:7]
+
         params = [p for i, p in enumerate(params) if i not in self.filter_out_idx]
 
         # off load to cpu to avoid oom with greedy algo
         device = params[0].device if num_views == 1 else "cpu"
         # device = "cpu" # we have to load to cpu because of inflation
+
+        print("Filter Out IDX: ", self.filter_out_idx)
+        for p in params:
+            if isinstance(p, OrderedDict):
+                print("p is an OrderedDict")
+                print("P: ", p)
+            else:
+                print("p is not an OrderedDict")
 
         H_train = torch.zeros(sum(p.numel() for p in params), device=params[0].device, dtype=params[0].dtype)
 
