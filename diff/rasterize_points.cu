@@ -32,6 +32,18 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
+__global__ void testKernel(int* radii, int P) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= P) return;
+
+    radii[idx] = idx * 10;  // Test write
+
+    if (idx < 10) {  // Print first few threads
+        printf("Thread %d: radii[%d] = %d\n", idx, idx, radii[idx]);
+    }
+}
+
+
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
@@ -65,9 +77,27 @@ RasterizeGaussiansCUDA(
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
-  torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
-  torch::Tensor out_depth = torch::full({H, W}, 0.0, float_opts);
-  torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
+//   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts).to(torch::kCUDA);
+  torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, torch::TensorOptions().dtype(torch::kFloat32));
+
+  out_color.fill_(0);
+//   torch::Tensor out_depth = torch::full({H, W}, 0.0, float_opts).to(torch::kCUDA);
+  torch::Tensor out_depth = torch::full({H, W}, 0.0, torch::TensorOptions().dtype(torch::kFloat32));
+  out_depth.fill_(0);
+
+  std::cout << "out_color[0][0][0]: " << out_color.index({0, 0, 0}).item<float>() << std::endl;
+  std::cout << "out_depth[0][0]: " << out_depth.index({0, 0}).item<float>() << std::endl;
+
+
+
+  torch::Tensor k_background = background.to(torch::kCPU);
+  std::cout << "Background[0]: " << k_background.index({0}).item<float>() << std::endl;
+
+
+  torch::Tensor radii = torch::full({P}, 0, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+  radii.fill_(0); 
+
+
   // n_contrib tracks number of gaussians contributed to each pixel
   torch::Tensor pixel_gaussian_counter = torch::full({H, W}, 0, means3D.options().dtype(torch::kInt32));
   
@@ -89,12 +119,33 @@ RasterizeGaussiansCUDA(
 		M = sh.size(1);
       }
 
+	  if (!radii.is_cuda()) {
+			printf("ERROR: radii tensor is not on GPU!\n");
+			exit(EXIT_FAILURE);
+	  }
+	  std::cout << "🚀 Address of radii in host: " << radii.data_ptr<int>() << std::endl;
+	//   testKernel<<<(P + 255) / 256, 256>>>(out_color.data_ptr<int>(), P);
+	  cudaDeviceSynchronize();
+
+	  if (out_color.device().is_cuda()) {
+		std::cout << "🚨 ERROR: out_color is on CUDA! You must copy it first." << std::endl;
+	  }
+	  if (out_depth.device().is_cuda()) {
+		std::cout << "🚨 ERROR: out_depth is on CUDA! You must copy it first." << std::endl;
+	  }
+
+
+
+	  radii = radii.contiguous();
+	  int* d_radii = radii.data_ptr<int>();
+
+
 	  rendered = CudaRasterizer::Rasterizer::forward(
 	    geomFunc,
 		binningFunc,
 		imgFunc,
 	    P, degree, M,
-		background.contiguous().data<float>(),
+		k_background.contiguous().data_ptr<float>(),
 		W, H,
 		means3D.contiguous().data<float>(),
 		sh.contiguous().data_ptr<float>(),
@@ -110,9 +161,9 @@ RasterizeGaussiansCUDA(
 		tan_fovx,
 		tan_fovy,
 		prefiltered,
-		out_color.contiguous().data<float>(),
-		out_depth.contiguous().data<float>(),
-		radii.contiguous().data<int>(),
+		out_color.contiguous().data_ptr<float>(),
+		out_depth.contiguous().data_ptr<float>(),
+		radii.data_ptr<int>(),
 		pixel_gaussian_counter.contiguous().data<int>(),
 		debug);
   }

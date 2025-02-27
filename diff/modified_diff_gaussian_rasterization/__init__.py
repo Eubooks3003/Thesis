@@ -14,6 +14,8 @@ import torch.nn as nn
 import torch
 from . import _C
 
+import numpy as np
+
 def cpu_deep_copy_tuple(input_tuple):
     copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
     return tuple(copied_tensors)
@@ -41,6 +43,105 @@ def rasterize_gaussians(
         raster_settings,
     )
 
+def validate_rasterize_args(args):
+    # Unpack the arguments
+    (
+        bg, 
+        means3D,
+        colors_precomp,
+        opacities,
+        scales,
+        rotations,
+        scale_modifier,
+        cov3Ds_precomp,
+        viewmatrix,
+        projmatrix,
+        tanfovx,
+        tanfovy,
+        image_height,
+        image_width,
+        sh,
+        sh_degree,
+        campos,
+        prefiltered,
+        debug
+    ) = args
+
+    def check_tensor(tensor, name):
+        if not isinstance(tensor, torch.Tensor):
+            print(f"Error: {name} is not a tensor.")
+            return
+        if not tensor.is_cuda:
+            print(f"Error: {name} is not on the GPU.")
+        if not tensor.is_contiguous():
+            print(f"Error: {name} is not contiguous.")
+        if torch.isnan(tensor).any():
+            print(f"Error: {name} contains NaNs.")
+        if torch.isinf(tensor).any():
+            print(f"Error: {name} contains Infs.")
+        print(f"{name}: Shape = {tuple(tensor.shape)}, Dtype = {tensor.dtype}, Device = {tensor.device}")
+
+    def check_array(arr, name):
+        if not isinstance(arr, np.ndarray):
+            print(f"Error: {name} is not a numpy array.")
+            return
+        if np.isnan(arr).any():
+            print(f"Error: {name} contains NaNs.")
+        if np.isinf(arr).any():
+            print(f"Error: {name} contains Infs.")
+        print(f"{name}: Shape = {arr.shape}, Dtype = {arr.dtype}")
+
+    def check_scalar(scalar, name):
+        if not isinstance(scalar, (int, float)):
+            print(f"Error: {name} is not a scalar.")
+            return
+        if np.isnan(scalar):
+            print(f"Error: {name} is NaN.")
+        if np.isinf(scalar):
+            print(f"Error: {name} is Inf.")
+        print(f"{name}: Value = {scalar}")
+
+    # Check tensors
+    check_tensor(means3D, "means3D")
+    check_tensor(colors_precomp, "colors_precomp")
+    check_tensor(opacities, "opacities")
+    check_tensor(scales, "scales")
+    check_tensor(rotations, "rotations")
+    check_tensor(cov3Ds_precomp, "cov3Ds_precomp")
+    check_tensor(sh, "sh")
+
+    # Check arrays/matrices
+    check_array(viewmatrix, "viewmatrix")
+    check_array(projmatrix, "projmatrix")
+    check_array(campos, "campos")
+
+    # Check scalars
+    check_scalar(scale_modifier, "scale_modifier")
+    check_scalar(tanfovx, "tanfovx")
+    check_scalar(tanfovy, "tanfovy")
+    check_scalar(image_height, "image_height")
+    check_scalar(image_width, "image_width")
+    check_scalar(sh_degree, "sh_degree")
+
+    # Check boolean flags
+    if not isinstance(prefiltered, bool):
+        print("Error: prefiltered is not a boolean.")
+    else:
+        print(f"prefiltered: {prefiltered}")
+
+    if not isinstance(debug, bool):
+        print("Error: debug is not a boolean.")
+    else:
+        print(f"debug: {debug}")
+
+    # Check background
+    if not isinstance(bg, (torch.Tensor, np.ndarray)):
+        print("Error: bg is neither a tensor nor a numpy array.")
+    else:
+        print(f"bg: Type = {type(bg)}, Dtype = {bg.dtype}, Shape = {bg.shape if isinstance(bg, np.ndarray) else tuple(bg.shape)}")
+
+
+
 class _RasterizeGaussians(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -57,6 +158,7 @@ class _RasterizeGaussians(torch.autograd.Function):
     ):
 
         # Restructure arguments the way that the C++ lib expects them
+        print("MEANS 3D SIZE: ", means3D.size(0), " --------------------------------------------------------")
         args = (
             raster_settings.bg, 
             means3D,
@@ -79,8 +181,37 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.debug
         )
 
+        print("IN RASTERIZE GAUSSIANS###################")
+
+        print("means3D NaN:", torch.isnan(means3D).any(), "Inf:", torch.isinf(means3D).any())
+        print("means2D NaN:", torch.isnan(means2D).any(), "Inf:", torch.isinf(means2D).any())
+
+
+        if colors_precomp is not None:
+            print("colors_precomp NaN:", torch.isnan(colors_precomp).any(), "Inf:", torch.isinf(colors_precomp).any())
+
+        print("opacities NaN:", torch.isnan(opacities).any(), "Inf:", torch.isinf(opacities).any())
+        print("scales NaN:", torch.isnan(scales).any(), "Inf:", torch.isinf(scales).any())
+        print("rotations NaN:", torch.isnan(rotations).any(), "Inf:", torch.isinf(rotations).any())
+
+        print("means3D is contiguous:", means3D.is_contiguous())
+        print("means2D is contiguous:", means2D.is_contiguous())
+        print("scales is contiguous:", scales.is_contiguous())
+        print("rotations is contiguous:", rotations.is_contiguous())
+        print("sh is contiguous:", sh.is_contiguous())
+        print("opacities is contiguous:", opacities.is_contiguous())
+
+        # Run the validation
+        validate_rasterize_args(args)
+
         # import pdb; pdb.set_trace()
         # Invoke C++/CUDA rasterizer
+
+
+        for idx, arg in enumerate(args):
+            if isinstance(arg, torch.Tensor):
+                print(f"Arg {idx}: NaN: {torch.isnan(arg).any()}, Inf: {torch.isinf(arg).any()}")
+                # print(f"Arg {idx} Min: {arg.min()}, Max: {arg.max()}")
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
@@ -91,6 +222,13 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raise ex
         else:
             num_rendered, color, depth, radii, geomBuffer, binningBuffer, imgBuffer, pixel_gaussian_counter = _C.rasterize_gaussians(*args)
+
+        print("Predicted image contains NaN: ", torch.isnan(color).any())
+        print("Predicted image contains Inf: ", torch.isinf(color).any())
+        # for idx, arg in enumerate(args):
+        #     if isinstance(arg, torch.Tensor):
+        #         print(f"Arg {idx}: NaN: {torch.isnan(arg).any()}, Inf: {torch.isinf(arg).any()}")
+        #         # print(f"Arg {idx} Min: {arg.min()}, Max: {arg.max()}")
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
@@ -155,6 +293,8 @@ class _RasterizeGaussians(torch.autograd.Function):
         )
 
         return grads
+    
+
 
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
@@ -198,15 +338,38 @@ class GaussianRasterizer(nn.Module):
         
         if shs is None:
             shs = torch.Tensor([])
+            print("shs none")
         if colors_precomp is None:
             colors_precomp = torch.Tensor([])
+            print("colors precomp none ")
 
         if scales is None:
             scales = torch.Tensor([])
+            print("scales none")
         if rotations is None:
             rotations = torch.Tensor([])
+            print("rotations none")
         if cov3D_precomp is None:
             cov3D_precomp = torch.Tensor([])
+            print("cov3d none")
+
+        print("IN THE FORWARD PASS###################")
+
+        print("means3D NaN:", torch.isnan(means3D).any(), "Inf:", torch.isinf(means3D).any())
+        print("means2D NaN:", torch.isnan(means2D).any(), "Inf:", torch.isinf(means2D).any())
+
+        if shs is not None:
+            print("shs NaN:", torch.isnan(shs).any(), "Inf:", torch.isinf(shs).any())
+
+        if colors_precomp is not None:
+            print("colors_precomp NaN:", torch.isnan(colors_precomp).any(), "Inf:", torch.isinf(colors_precomp).any())
+
+        print("opacities NaN:", torch.isnan(opacities).any(), "Inf:", torch.isinf(opacities).any())
+        print("scales NaN:", torch.isnan(scales).any(), "Inf:", torch.isinf(scales).any())
+        print("rotations NaN:", torch.isnan(rotations).any(), "Inf:", torch.isinf(rotations).any())
+
+        if cov3D_precomp is not None:
+            print("cov3D_precomp NaN:", torch.isnan(cov3D_precomp).any(), "Inf:", torch.isinf(cov3D_precomp).any())
 
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians(

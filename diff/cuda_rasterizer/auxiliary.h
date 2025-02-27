@@ -57,16 +57,31 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)
 {
-	float3 transformed = {
-		matrix[0] * p.x + matrix[4] * p.y + matrix[8] * p.z + matrix[12],
-		matrix[1] * p.x + matrix[5] * p.y + matrix[9] * p.z + matrix[13],
-		matrix[2] * p.x + matrix[6] * p.y + matrix[10] * p.z + matrix[14],
-	};
-	return transformed;
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    float3 transformed = {
+        matrix[0] * p.x + matrix[4] * p.y + matrix[8] * p.z + matrix[12],
+        matrix[1] * p.x + matrix[5] * p.y + matrix[9] * p.z + matrix[13],
+        matrix[2] * p.x + matrix[6] * p.y + matrix[10] * p.z + matrix[14],
+    };
+
+    // 🚨 Print transformed point to ensure it's valid
+    // if (idx == 0) {
+    //     printf("Thread 0: transformPoint4x3 output = (%f, %f, %f)\n", transformed.x, transformed.y, transformed.z);
+    // }
+
+    return transformed;
 }
+
 
 __forceinline__ __device__ float4 transformPoint4x4(const float3& p, const float* matrix)
 {
+	// if (!matrix) {
+	// 	if (threadIdx.x == 0 && blockIdx.x == 0) {
+	// 		printf("ERROR: transformPoint4x4 received NULL matrix!\n");
+	// 		return make_float4(0, 0, 0, 1);
+    //     }
+    // }
 	float4 transformed = {
 		matrix[0] * p.x + matrix[4] * p.y + matrix[8] * p.z + matrix[12],
 		matrix[1] * p.x + matrix[5] * p.y + matrix[9] * p.z + matrix[13],

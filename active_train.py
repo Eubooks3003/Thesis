@@ -16,6 +16,7 @@ from utils.loss_utils import ssim
 from lpipsPyTorch import lpips, lpips_func
 from active import methods_dict
 import wandb
+import copy
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -49,7 +50,6 @@ def load_checkpoint(ckpt_path: str, gaussians, scene, opt, ignore_train_idxs=Fal
     base_iter = ckpt_dict.get("base_iter", 0)
     return first_iter, base_iter
 
-
 def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
     first_iter = 0
     base_iter = 0
@@ -60,13 +60,47 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
 
     # Use Scene from Fisher RF
     scene = Scene(dataset, gaussians)
+
+    schema = schema_dict[args.schema](dataset_size=len(scene.getTrainCameras()), scene=scene)
+    print(f"schema: {schema.load_its}")
+    scene.train_idxs = schema.init_views
+
+    active_method = methods_dict[args.method](args)
+
+    print("Coarse Iterations: ", opt.coarse_iterations)
+    print("Iterations: ",  opt.iterations)
+    scene_reconstruction_4D(dataset, hyper, opt, pipe, testing_iterations, saving_iterations,
+                            checkpoint_iterations, checkpoint, debug_from,
+                            gaussians, scene, "coarse", tb_writer, opt.coarse_iterations, active_method, schema)
+
+    op_iterations = 30_000 # TODO: Figure out what is happening why is it 20_000????
+    scene_reconstruction_4D(dataset, hyper, opt, pipe, testing_iterations, saving_iterations,
+                        checkpoint_iterations, checkpoint, debug_from,
+                        gaussians, scene, "fine", tb_writer, op_iterations, active_method, schema)                      
+    
+
+
+def scene_reconstruction(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
+gaussians, scene, stage, tb_writer, train_iter):
+    first_iter = 0
+    base_iter = 0
+    # tb_writer = prepare_output_and_logger(dataset)
+
+    # # Use Gaussian Model from 4D Gaussian
+    # gaussians = GaussianModel4D(dataset.sh_degree, hyper)
+
+    # Use Scene from Fisher RF
+    # scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     
     # Active View Selection
     schema = schema_dict[args.schema](dataset_size=len(scene.getTrainCameras()), scene=scene)
     print(f"schema: {schema.load_its}")
 
-    # scene.train_idxs = schema.init_views
+    if False:
+        scene.train_idxs = schema.init_views
+
+        # TODO: Temporary hack, fix so that the views get added throughout corase + fine
 
     active_method = methods_dict[args.method](args)
 
@@ -89,9 +123,33 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    print("Iterations: ", opt.iterations)
+    progress_bar = tqdm(range(first_iter, train_iter), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+
+    batch_size = opt.batch_size
+    print("data loading done")
+    if opt.dataloader:
+        viewpoint_stack = scene.getTrainCameras()
+        if opt.custom_sampler is not None:
+            sampler = FineSampler(viewpoint_stack)
+            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,sampler=sampler,num_workers=16,collate_fn=list)
+            random_loader = False
+        else:
+            viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,shuffle=True,num_workers=16,collate_fn=list)
+            random_loader = True
+        loader = iter(viewpoint_stack_loader)
+    
+
+    if stage == "coarse" and opt.zerostamp_init:
+        load_in_memory = True
+        # batch_size = 4
+        temp_list = get_stamp_list(viewpoint_stack,0)
+        viewpoint_stack = temp_list.copy()
+    else:
+        load_in_memory = False 
+
+    for iteration in range(first_iter, train_iter + 1):        
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -103,13 +161,17 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
                     net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+                if do_training and ((iteration < int(train_iter)) or not keep_alive):
                     break
             except Exception as e:
                 network_gui.conn = None
-
-        # num_views = schema.num_views_to_add(iteration)
-        num_views = 0
+        
+        if False:
+            num_views = schema.num_views_to_add(iteration)
+        else:
+            num_views = 0
+        # TODO: Temporary hack, fix so that the views get added throughout corase + fine
+       
         if num_views > 0:
             try:
                 # For sectioned training
@@ -144,19 +206,87 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+        batch_size=opt.batch_size
+        if opt.dataloader and not load_in_memory:
+            try:
+                viewpoint_cams = next(loader)
+            except StopIteration:
+                print("reset dataloader into random dataloader.")
+                if not random_loader:
+                    viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=opt.batch_size,shuffle=True,num_workers=32,collate_fn=list)
+                    random_loader = True
+                loader = iter(viewpoint_stack_loader)
+        
+        else:
+            idx = 0
+            viewpoint_cams = []
+
+            while idx < batch_size :    
+                    
+                viewpoint_cam = viewpoint_stack.pop(randint(0,len(viewpoint_stack)-1))
+                viewpoint_cams.append(viewpoint_cam)
+                idx +=1
+            if len(viewpoint_cams) == 0:
+                continue
+
+        # viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+        images = []
+        gt_images = []
+        radii_list = []
+        visibility_filter_list = []
+        viewspace_point_tensor_list = []
+        for viewpoint_cam in viewpoint_cams:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+            images.append(image.unsqueeze(0))
+            gt_image = viewpoint_cam.original_image.cuda()
+            
+            gt_images.append(gt_image.unsqueeze(0))
+            radii_list.append(radii.unsqueeze(0))
+            visibility_filter_list.append(visibility_filter.unsqueeze(0))
+            viewspace_point_tensor_list.append(viewspace_point_tensor)
+        
+        # render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+        # image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+        radii = torch.cat(radii_list,0).max(dim=0).values
+        visibility_filter = torch.cat(visibility_filter_list).any(dim=0)
+        image_tensor = torch.cat(images,0)
+        gt_image_tensor = torch.cat(gt_images,0)
 
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
+        # Fisher RF stuff
+        # gt_image = viewpoint_cam.original_image.cuda()
+        # Ll1 = l1_loss(image, gt_image)
+        # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
+        Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
+        psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
+
+        loss = Ll1
+        if stage == "fine" and hyper.time_smoothness_weight != 0:
+            # tv_loss = 0
+            tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
+            loss += tv_loss
+        if opt.lambda_dssim != 0:
+            ssim_loss = ssim(image_tensor,gt_image_tensor)
+            loss += opt.lambda_dssim * (1.0-ssim_loss)
+
         loss.backward()
+
+        if torch.isnan(loss).any():
+            print("loss is nan,end training, reexecv program now.")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
+        for idx in range(0, len(viewspace_point_tensor_list)):
+            viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
 
         iter_end.record()
 
@@ -169,9 +299,10 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
+                                          "psnr": f"{psnr_:.{2}f}"})
                 progress_bar.update(10)
-            if iteration == opt.iterations:
+            if iteration == train_iter:
                 progress_bar.close()
 
             before_selection = schema.num_views_to_add(iteration + 1) > 0
@@ -180,7 +311,7 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
                             testing_iterations, scene, render, (pipe, background), before_selection=before_selection, 
                             log_every_image=args.log_every_image)
 
-            stage = "coarse" # Only use fine for now until I figure out how to get the coarse and fine to interface with FisherRF
+            # stage = "coarse" # Only use fine for now until I figure out how to get the coarse and fine to interface with FisherRF
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 print("Saving Gaussians:  ",  gaussians._deformation.deformation_net.grid.grids)
@@ -217,7 +348,7 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
                     gaussians.reset_opacity()
 
             # Optimizer step
-            if iteration < opt.iterations:
+            if iteration < train_iter:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
         
@@ -225,6 +356,305 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
             print("Saving: ", gaussians._deformation.grid.grids)
             save_checkpoint(gaussians, iteration, scene)
     wandb.finish()
+
+
+def scene_reconstruction_4D(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, 
+                         checkpoint_iterations, checkpoint, debug_from,
+                         gaussians, scene, stage, tb_writer, train_iter, active_method, schema):
+    first_iter = 0
+
+    gaussians.training_setup(opt)
+    if checkpoint:
+        # breakpoint()
+        if stage == "coarse" and stage not in checkpoint:
+            print("start from fine stage, skip coarse stage.")
+            # process is in the coarse stage, but start from fine stage
+            return
+        if stage in checkpoint: 
+            (model_params, first_iter) = torch.load(checkpoint)
+            gaussians.restore(model_params, opt)
+
+
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    iter_start = torch.cuda.Event(enable_timing = True)
+    iter_end = torch.cuda.Event(enable_timing = True)
+
+    viewpoint_stack = None
+    ema_loss_for_log = 0.0
+    ema_psnr_for_log = 0.0
+
+    final_iter = train_iter
+    
+    progress_bar = tqdm(range(first_iter, final_iter), desc="Training progress")
+    first_iter += 1
+    # lpips_model = lpips.LPIPS(net="alex").cuda()
+    video_cams = scene.getVideoCameras()
+    test_cams = scene.getTestCameras()
+    train_cams = scene.getTrainCameras()
+
+    # Comment out since active view selection should start with very little views
+    # if not viewpoint_stack and not opt.dataloader:
+    #     # dnerf's branch
+    #     viewpoint_stack = [i for i in train_cams]
+    #     temp_list = copy.deepcopy(viewpoint_stack)
+
+    # 
+    batch_size = opt.batch_size
+    print("data loading done")
+
+    # if opt.dataloader:
+    #     viewpoint_stack = scene.getTrainCameras()
+    #     if opt.custom_sampler is not None:
+    #         sampler = FineSampler(viewpoint_stack)
+    #         viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,sampler=sampler,num_workers=16,collate_fn=list)
+    #         random_loader = False
+    #     else:
+    #         viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=batch_size,shuffle=True,num_workers=16,collate_fn=list)
+    #         random_loader = True
+    #     loader = iter(viewpoint_stack_loader)
+    
+    
+    # dynerf, zerostamp_init
+    # breakpoint()
+    if stage == "coarse" and opt.zerostamp_init:
+        load_in_memory = True
+        # batch_size = 4
+        temp_list = get_stamp_list(viewpoint_stack,0)
+        viewpoint_stack = temp_list.copy()
+    else:
+        load_in_memory = False 
+
+
+    count = 0
+    for iteration in range(first_iter, final_iter+1):        
+        if network_gui.conn == None:
+            network_gui.try_connect()
+        while network_gui.conn != None:
+            try:
+                net_image_bytes = None
+                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+                if custom_cam != None:
+                    count +=1
+                    viewpoint_index = (count ) % len(video_cams)
+                    if (count //(len(video_cams))) % 2 == 0:
+                        viewpoint_index = viewpoint_index
+                    else:
+                        viewpoint_index = len(video_cams) - viewpoint_index - 1
+                    # print(viewpoint_index)
+                    viewpoint = video_cams[viewpoint_index]
+                    custom_cam.time = viewpoint.time
+                    # print(custom_cam.time, viewpoint_index, count)
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer, stage=stage, cam_type=scene.dataset_type)["render"]
+
+                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                network_gui.send(net_image_bytes, dataset.source_path)
+                if do_training and ((iteration < int(opt.iterations)) or not keep_alive) :
+                    break
+            except Exception as e:
+                print(e)
+                network_gui.conn = None
+        
+        # Fisher RF Start
+
+        it = iteration
+        if stage == "fine":
+            # account for the coarse iterations that have already happened
+            it += opt.coarse_iterations
+        num_views = schema.num_views_to_add(it)
+        if num_views > 0:
+            try:
+                # For sectioned training
+                candidate_views_filter = getattr(schema, "candidate_views_filter")[it] if hasattr(schema, "candidate_views_filter") else None
+                scene.candidate_views_filter = candidate_views_filter
+                
+                # Because selection is time consumeing
+                selected_views = active_method.nbvs(gaussians, scene, num_views, pipe, background, exit_func=csm.should_exit)
+            except RuntimeError as e:
+                print(e)
+                print("selector exited early")
+                # NOTE: we use iteration - 1 because the selector is not done
+                save_checkpoint(gaussians, iteration - 1, scene)
+                csm.requeue()
+
+            print(f"ITER {it}: selected views: {selected_views}")
+            scene.train_idxs.extend(selected_views)
+            print(f"ITER {it}: training views after selection: {scene.train_idxs}")
+
+            gaussians.optimizer.zero_grad(set_to_none = True)
+
+            first_iter, _ = load_checkpoint(init_ckpt_path, gaussians, scene, opt, ignore_train_idxs=True)
+            base_iter = iteration - 1
+
+        # FisherRF end 
+
+        iter_start.record()
+
+        gaussians.update_learning_rate(iteration)
+
+        # Every 1000 its we increase the levels of SH up to a maximum degree
+        if iteration % 1000 == 0:
+            gaussians.oneupSHdegree()
+
+            print("Gaussians State Dict: ", gaussians._deformation.state_dict().keys())
+
+        # Pick a random Camera
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+
+        # dynerf's branch
+
+        # if opt.dataloader and not load_in_memory:
+        #     try:
+        #         viewpoint_cams = next(loader)
+        #     except StopIteration:
+        #         print("reset dataloader into random dataloader.")
+        #         if not random_loader:
+        #             viewpoint_stack_loader = DataLoader(viewpoint_stack, batch_size=opt.batch_size,shuffle=True,num_workers=32,collate_fn=list)
+        #             random_loader = True
+        #         loader = iter(viewpoint_stack_loader)
+
+        idx = 0
+        viewpoint_cams = []
+
+        while idx < batch_size :    
+                
+            viewpoint_cam = viewpoint_stack.pop(randint(0,len(viewpoint_stack)-1))
+            # if not viewpoint_stack :
+            #     viewpoint_stack =  temp_list.copy()
+            viewpoint_cams.append(viewpoint_cam)
+            idx +=1
+        if len(viewpoint_cams) == 0:
+            continue
+
+        # print(len(viewpoint_cams))     
+        # breakpoint()   
+        # Render
+        if (iteration - 1) == debug_from:
+            pipe.debug = True
+        images = []
+        gt_images = []
+        radii_list = []
+        visibility_filter_list = []
+        viewspace_point_tensor_list = []
+        for viewpoint_cam in viewpoint_cams:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
+            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+            images.append(image.unsqueeze(0))
+            if scene.dataset_type!="PanopticSports":
+                gt_image = viewpoint_cam.original_image.cuda()
+            else:
+                gt_image  = viewpoint_cam['image'].cuda()
+            
+            gt_images.append(gt_image.unsqueeze(0))
+            radii_list.append(radii.unsqueeze(0))
+            visibility_filter_list.append(visibility_filter.unsqueeze(0))
+            viewspace_point_tensor_list.append(viewspace_point_tensor)
+        
+
+        radii = torch.cat(radii_list,0).max(dim=0).values
+        visibility_filter = torch.cat(visibility_filter_list).any(dim=0)
+        image_tensor = torch.cat(images,0)
+        gt_image_tensor = torch.cat(gt_images,0)
+        # Loss
+        # breakpoint()
+        Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
+
+        psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
+        # norm
+        
+
+        loss = Ll1
+        if stage == "fine" and hyper.time_smoothness_weight != 0:
+            # tv_loss = 0
+            tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
+            loss += tv_loss
+        if opt.lambda_dssim != 0:
+            ssim_loss = ssim(image_tensor,gt_image_tensor)
+            loss += opt.lambda_dssim * (1.0-ssim_loss)
+        # if opt.lambda_lpips !=0:
+        #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
+        #     loss += opt.lambda_lpips * lpipsloss
+        
+        loss.backward()
+        if torch.isnan(loss).any():
+            print("loss is nan,end training, reexecv program now.")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
+        for idx in range(0, len(viewspace_point_tensor_list)):
+            viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
+        iter_end.record()
+
+        with torch.no_grad():
+            # Progress bar
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            ema_psnr_for_log = 0.4 * psnr_ + 0.6 * ema_psnr_for_log
+            total_point = gaussians._xyz.shape[0]
+            if iteration % 10 == 0:
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
+                                          "psnr": f"{psnr_:.{2}f}",
+                                          "point":f"{total_point}"})
+                progress_bar.update(10)
+            if iteration == opt.iterations:
+                progress_bar.close()
+
+            # Log and save
+            # timer.pause()
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage, scene.dataset_type)
+            if (iteration in saving_iterations):
+                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                scene.save(iteration, stage)
+            # if dataset.render_process:
+            #     if (iteration < 1000 and iteration % 10 == 9) \
+            #         or (iteration < 3000 and iteration % 50 == 49) \
+            #             or (iteration < 60000 and iteration %  100 == 99) :
+                    # breakpoint()
+                        # render_training_image(scene, gaussians, [test_cams[iteration%len(test_cams)]], render, pipe, background, stage+"test", iteration,timer.get_elapsed_time(),scene.dataset_type)
+                        # render_training_image(scene, gaussians, [train_cams[iteration%len(train_cams)]], render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
+                        # render_training_image(scene, gaussians, train_cams, render, pipe, background, stage+"train", iteration,timer.get_elapsed_time(),scene.dataset_type)
+
+                    # total_images.append(to8b(temp_image).transpose(1,2,0))
+            # timer.start()
+            # Densification
+            if iteration < opt.densify_until_iter :
+                # Keep track of max radii in image-space for pruning
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                gaussians.add_densification_stats(viewspace_point_tensor_grad, visibility_filter)
+
+                if stage == "coarse":
+                    opacity_threshold = opt.opacity_threshold_coarse
+                    densify_threshold = opt.densify_grad_threshold_coarse
+                else:    
+                    opacity_threshold = opt.opacity_threshold_fine_init - iteration*(opt.opacity_threshold_fine_init - opt.opacity_threshold_fine_after)/(opt.densify_until_iter)  
+                    densify_threshold = opt.densify_grad_threshold_fine_init - iteration*(opt.densify_grad_threshold_fine_init - opt.densify_grad_threshold_after)/(opt.densify_until_iter )  
+                if  iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<360000:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    
+                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, 5, 5, scene.model_path, iteration, stage)
+                if  iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0 and gaussians.get_xyz.shape[0]>200000:
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+
+                    gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
+                    
+                # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
+                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<360000 and opt.add_point:
+                    gaussians.grow(5,5,scene.model_path,iteration,stage)
+                    # torch.cuda.empty_cache()
+                if iteration % opt.opacity_reset_interval == 0:
+                    print("reset opacity")
+                    gaussians.reset_opacity()
+                    
+            
+
+            # Optimizer step
+            if iteration < opt.iterations:
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none = True)
+
+            if (iteration in checkpoint_iterations):
+                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" +f"_{stage}_" + str(iteration) + ".pth")
 
         
 
@@ -251,13 +681,20 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, before_selection=False, log_every_image=False):
+    if wandb.run is None:
+        wandb.init(
+            project="Thesis",
+            name="run 2",
+            resume="allow"  # Allow resuming or starting new
+        )
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
-    if iteration in testing_iterations or before_selection:
+    # if iteration in testing_iterations or before_selection  (FisherRF)
+    if iteration in testing_iterations:
         print(f"Running evaluation for iteration: {iteration}")
         torch.cuda.empty_cache()
         lpips = lpips_func("cuda", net_type='vgg')
@@ -355,6 +792,11 @@ if __name__ == "__main__":
     # From 4D Gaussians
     parser.add_argument("--configs", type=str, default = "")
 
+    wandb.init(
+        project='Thesis',
+        name='run 2',  
+    )
+
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     if args.log_every_image:
@@ -362,8 +804,10 @@ if __name__ == "__main__":
     if args.iterations not in args.test_iterations:
         args.test_iterations.append(args.iterations)
     
-    if args.start_checkpoint is None:
-        args.start_checkpoint = args.model_path + "/last.pth"
+    # if args.start_checkpoint is None:
+    #     args.start_checkpoint = args.model_path + "/last.pth"
+
+    print("Args Iterations: ", args.iterations)
     
     # From 4D Gaussians
     if args.configs:

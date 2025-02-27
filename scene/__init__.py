@@ -19,7 +19,7 @@ from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON, load_cam_info
 from tqdm import tqdm
 
-from scene.dataset import FourDGSdataset
+from scene.dataset_4D import FourDGSdataset
 
 from scene.gaussian_model4D import GaussianModel4D
 
@@ -45,7 +45,9 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
+        self.video_cameras = {}
 
+        print("source path: ", args.source_path)
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, 
                                                           llffhold=llffhold, override_train_idxs=override_train_idxs, override_test_idxs=override_test_idxs)
@@ -53,10 +55,12 @@ class Scene:
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+            print("Scene info keys: ", dir(scene_info))
             dataset_type="blender"
         else:
             assert False, "Could not recognize scene type!"
 
+        self.dataset_type = dataset_type
         self.maxtime = scene_info.maxtime
 
         if not self.loaded_iter:
@@ -68,6 +72,8 @@ class Scene:
                 camlist.extend(scene_info.test_cameras)
             if scene_info.train_cameras:
                 camlist.extend(scene_info.train_cameras)
+            if scene_info.video_cameras:
+                camlist.extend(scene_info.video_cameras)
             for id, cam in enumerate(camlist):
                 json_cams.append(camera_to_JSON(id, cam))
             with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
@@ -90,6 +96,8 @@ class Scene:
             self.train_cameras[resolution_scale] = FourDGSdataset(scene_info.train_cameras, args, dataset_type)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = FourDGSdataset(scene_info.test_cameras, args, dataset_type)
+            print("Loading Video Cameras")
+            self.video_cameras[resolution_scale] = FourDGSdataset(scene_info.video_cameras, args, dataset_type)
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
@@ -117,6 +125,9 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+    
+    def getVideoCameras(self, scale = 1.0):
+        return self.video_cameras[scale]
     
     def get_candidate_set(self):
         # Get candidate set 

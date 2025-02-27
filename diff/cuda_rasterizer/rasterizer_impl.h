@@ -15,15 +15,35 @@
 #include <vector>
 #include "rasterizer.h"
 #include <cuda_runtime_api.h>
+#include <cstddef>   // For std::uintptr_t
+#include <cstdlib>   // For std::aligned_alloc (C++17) or malloc (C++11)
 
 namespace CudaRasterizer
 {
+	// template <typename T>
+	// static void obtain(char*& chunk, T*& ptr, std::size_t count, std::size_t alignment)
+	// {
+	// 	std::size_t offset = (reinterpret_cast<std::uintptr_t>(chunk) + alignment - 1) & ~(alignment - 1);
+	// 	ptr = reinterpret_cast<T*>(offset);
+	// 	chunk = reinterpret_cast<char*>(ptr + count);
+	// }
+
 	template <typename T>
 	static void obtain(char*& chunk, T*& ptr, std::size_t count, std::size_t alignment)
 	{
-		std::size_t offset = (reinterpret_cast<std::uintptr_t>(chunk) + alignment - 1) & ~(alignment - 1);
-		ptr = reinterpret_cast<T*>(offset);
-		chunk = reinterpret_cast<char*>(ptr + count);
+		// Compute the next aligned address
+		std::uintptr_t raw = reinterpret_cast<std::uintptr_t>(chunk);
+		std::uintptr_t aligned = (raw + (alignment - 1)) & ~(alignment - 1);
+
+		ptr = reinterpret_cast<T*>(aligned); // Assign aligned pointer
+		chunk = reinterpret_cast<char*>(aligned + count * sizeof(T)); // Advance pointer
+
+		// Debug print with variable name
+		// // Check if allocation failed
+		// if (ptr == nullptr) {
+		// 	printf("ERROR: Allocation failed for %s!\n", typeid(T).name());
+		// 	exit(EXIT_FAILURE);  // Stop execution immediately
+		// }
 	}
 
 	struct GeometryState

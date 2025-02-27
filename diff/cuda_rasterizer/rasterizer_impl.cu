@@ -30,6 +30,9 @@ namespace cg = cooperative_groups;
 #include "forward.h"
 #include "backward.h"
 
+#define CHECK_PTR(ptr, name) if (!(ptr)) { printf("Error: %s is NULL!\n", name); exit(EXIT_FAILURE); }
+
+
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
 uint32_t getHigherMsb(uint32_t n)
@@ -77,37 +80,38 @@ __global__ void duplicateWithKeys(
 	int* radii,
 	dim3 grid)
 {
-	auto idx = cg::this_grid().thread_rank();
-	if (idx >= P)
-		return;
+	return;
+	// auto idx = cg::this_grid().thread_rank();
+	// if (idx >= P)
+	// 	return;
 
 	// Generate no key/value pair for invisible Gaussians
-	if (radii[idx] > 0)
-	{
-		// Find this Gaussian's offset in buffer for writing keys/values.
-		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
-		uint2 rect_min, rect_max;
+	// if (radii[idx] > 0)
+	// {
+	// 	// Find this Gaussian's offset in buffer for writing keys/values.
+	// 	uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+	// 	uint2 rect_min, rect_max;
 
-		getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+	// 	getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 
-		// For each tile that the bounding rect overlaps, emit a 
-		// key/value pair. The key is |  tile ID  |      depth      |,
-		// and the value is the ID of the Gaussian. Sorting the values 
-		// with this key yields Gaussian IDs in a list, such that they
-		// are first sorted by tile and then by depth. 
-		for (int y = rect_min.y; y < rect_max.y; y++)
-		{
-			for (int x = rect_min.x; x < rect_max.x; x++)
-			{
-				uint64_t key = y * grid.x + x;
-				key <<= 32;
-				key |= *((uint32_t*)&depths[idx]);
-				gaussian_keys_unsorted[off] = key;
-				gaussian_values_unsorted[off] = idx;
-				off++;
-			}
-		}
-	}
+	// 	// For each tile that the bounding rect overlaps, emit a 
+	// 	// key/value pair. The key is |  tile ID  |      depth      |,
+	// 	// and the value is the ID of the Gaussian. Sorting the values 
+	// 	// with this key yields Gaussian IDs in a list, such that they
+	// 	// are first sorted by tile and then by depth. 
+	// 	for (int y = rect_min.y; y < rect_max.y; y++)
+	// 	{
+	// 		for (int x = rect_min.x; x < rect_max.x; x++)
+	// 		{
+	// 			uint64_t key = y * grid.x + x;
+	// 			key <<= 32;
+	// 			key |= *((uint32_t*)&depths[idx]);
+	// 			gaussian_keys_unsorted[off] = key;
+	// 			gaussian_values_unsorted[off] = idx;
+	// 			off++;
+	// 		}
+	// 	}
+	// }
 }
 
 // Check keys to see if it is at the start/end of one tile's range in 
@@ -220,25 +224,57 @@ int CudaRasterizer::Rasterizer::forward(
 	int *radii,
 	int *pixel_gaussian_counter,
 	bool debug)
-{
+{	
+	printf("FORWARD++++++++++++++++++++++++++++++++\n");
+	printf("🚀 Inside Rasterizer::forward(), radii address: %p\n", radii);
+	printf("🚀 Inside Rasterizer::forward(), background address: %p\n", background);
+	printf("🚀 Inside Rasterizer::forward(), out_color address: %p\n", out_color);
+	printf("🚀 Inside Rasterizer::forward(), out_depth address: %p\n", out_depth);
+
+	std::cout << "Host out_color[0]: " << out_color[0] << std::endl;
+	std::cout << "Host background[0]: " << background[0] << std::endl;
+
+
+	cudaError_t err = cudaGetLastError();
+	if (err != cudaSuccess) {
+		printf("Error forward: %s\n", cudaGetErrorString(err));
+	}
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
 	size_t chunk_size = required<GeometryState>(P);
-	char* chunkptr = geometryBuffer(chunk_size);
+
+	// char* chunkptr = geometryBuffer(chunk_size);
+	char* chunkptr = new char[chunk_size];
+
+
 	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
 
 	if (radii == nullptr)
 	{
+		printf("USING GEOMSTATE RADII\n");
 		radii = geomState.internal_radii;
 	}
+	else{
+		printf("USING PASSED IN RADII\n");
+	}
+
+	geomState.clamped[0] = false;
+
+
+	geomState.tiles_touched[0] = 0;
+
+
+	int temp_radii = 0;
+	cudaMemcpy(radii, &temp_radii, sizeof(int), cudaMemcpyHostToDevice);
+
 
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 
 	// Dynamically resize image-based auxiliary buffers during training
 	size_t img_chunk_size = required<ImageState>(width * height);
-	char* img_chunkptr = imageBuffer(img_chunk_size);
+	char* img_chunkptr = new char[img_chunk_size];
 	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
 
 	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
@@ -246,7 +282,35 @@ int CudaRasterizer::Rasterizer::forward(
 		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
 	}
 
+	CHECK_PTR(means3D, "means3D");
+	CHECK_PTR(scales, "scales");
+	CHECK_PTR(rotations, "rotations");
+	CHECK_PTR(opacities, "opacities");
+	CHECK_PTR(shs, "shs");
+	CHECK_PTR(geomState.clamped, "geomState.clamped");
+	// CHECK_PTR(cov3D_precomp, "cov3D_precomp");
+	// CHECK_PTR(colors_precomp, "colors_precomp");
+	CHECK_PTR(viewmatrix, "viewmatrix");
+	CHECK_PTR(projmatrix, "projmatrix");
+	CHECK_PTR(cam_pos, "cam_pos");
+	CHECK_PTR(radii, "radii");
+	CHECK_PTR(geomState.means2D, "geomState.means2D");
+	CHECK_PTR(geomState.depths, "geomState.depths");
+	CHECK_PTR(geomState.cov3D, "geomState.cov3D");
+	CHECK_PTR(geomState.rgb, "geomState.rgb");
+	CHECK_PTR(geomState.conic_opacity, "geomState.conic_opacity");
+	CHECK_PTR(geomState.tiles_touched, "geomState.tiles_touched");
+
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
+
+	cudaDeviceSynchronize();
+	err = cudaGetLastError(); 
+	if (err != cudaSuccess) {
+		printf("🚨 CUDA Error BEFORE `FORWARD::render`: %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__);
+	}
+
+
+
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
 		means3D,
@@ -274,20 +338,87 @@ int CudaRasterizer::Rasterizer::forward(
 		prefiltered
 	), debug)
 
+	cudaDeviceSynchronize();
+	err = cudaGetLastError(); 
+	if (err != cudaSuccess) {
+		printf("🚨 CUDA Error BEFORE `FORWARD::render`: %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__);
+	}
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
-	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
 
+	// Zero initialize device memory
+	std::memset(geomState.point_offsets, 0, P * sizeof(uint32_t));
+
+	// Step 1: Determine if tiles_touched is on CPU or GPU
+	// cudaPointerAttributes attr;
+	// cudaPointerGetAttributes(&attr, geomState.tiles_touched);
+
+	// if (attr.type != cudaMemoryTypeDevice) {
+	// 	printf("🚨 tiles_touched is not on CUDA. Converting to CUDA memory.\n");
+
+	// 	// Step 2: Allocate CUDA memory
+	// 	uint32_t* d_tiles_touched;
+	// 	cudaMalloc(&d_tiles_touched, P * sizeof(uint32_t));
+
+	// 	// Step 3: Copy existing values from CPU to CUDA memory
+	// 	cudaMemcpy(d_tiles_touched, geomState.tiles_touched, P * sizeof(uint32_t), cudaMemcpyHostToDevice);
+
+	// 	// Step 4: Update the pointer to point to CUDA memory
+	// 	geomState.tiles_touched = d_tiles_touched;
+	// 	printf("✅ tiles_touched is now in CUDA memory.\n");
+	// }
+
+	// cudaPointerGetAttributes(&attr, geomState.point_offsets);
+	// if (attr.type != cudaMemoryTypeDevice) {
+	// 	uint32_t* d_point_offsets;
+	// 	cudaMalloc(&d_point_offsets, P * sizeof(uint32_t));
+	// 	cudaMemcpy(d_point_offsets, geomState.point_offsets, P * sizeof(uint32_t), cudaMemcpyHostToDevice);
+	// 	geomState.point_offsets = d_point_offsets;
+	// }
+	
+	
+	// CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+
+
+	size_t temp_storage_bytes = 0;
+	cub::DeviceScan::InclusiveSum(nullptr, temp_storage_bytes, geomState.tiles_touched, geomState.point_offsets, P);
+
+	// Allocate the required temporary storage
+	cudaMalloc(&geomState.scanning_space, temp_storage_bytes);
+	geomState.scan_size = temp_storage_bytes;
+
+	cudaDeviceSynchronize();
+	err = cudaGetLastError(); 
+	if (err != cudaSuccess) {
+		printf("🚨 CUDA Error BEFORE `FORWARD::render`: %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__);
+	}
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
+
+	cudaDeviceSynchronize();
+	err = cudaGetLastError(); 
+	if (err != cudaSuccess) {
+		printf("🚨 CUDA Error BEFORE `FORWARD::render`: %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__);
+	}
+
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 
+
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
-	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	char* binning_chunkptr = new char[binning_chunk_size];
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
+	cudaDeviceSynchronize();
+	err = cudaGetLastError(); 
+	if (err != cudaSuccess) {
+		printf("🚨 CUDA Error BEFORE `FORWARD::render`: %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__);
+	}
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
+
+	printf("P: %d\n", P);
+	printf("tile_grid: (%d, %d)\n", tile_grid.x, tile_grid.y);
+
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,
@@ -300,16 +431,46 @@ int CudaRasterizer::Rasterizer::forward(
 	CHECK_CUDA(, debug)
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+	
+
+	err = cudaGetLastError(); 
+	if (err != cudaSuccess) {
+		printf("🚨 CUDA Error BEFORE `FORWARD::render`: %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__);
+	}
 
 	// Sort complete list of (duplicated) Gaussian indices by keys
-	CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
-		binningState.list_sorting_space,
-		binningState.sorting_size,
+	// CHECK_CUDA(cub::DeviceRadixSort::SortPairs(
+	// 	binningState.list_sorting_space,
+	// 	binningState.sorting_size,
+	// 	binningState.point_list_keys_unsorted, binningState.point_list_keys,
+	// 	binningState.point_list_unsorted, binningState.point_list,
+	// 	num_rendered, 0, 32 + bit), debug)
+
+	temp_storage_bytes = 0;
+	cub::DeviceRadixSort::SortPairs(
+		nullptr, temp_storage_bytes,
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
-		num_rendered, 0, 32 + bit), debug)
+		num_rendered, 0, 32 + bit
+	);
+	
+	// Allocate required temporary storage
+	cudaMalloc(&binningState.list_sorting_space, temp_storage_bytes);
+	binningState.sorting_size = temp_storage_bytes;
+
+	err = cudaGetLastError(); 
+	if (err != cudaSuccess) {
+		printf("🚨 CUDA Error BEFORE `FORWARD::render`: %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__);
+	}
+
+
 
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+
+	err = cudaGetLastError(); 
+	if (err != cudaSuccess) {
+		printf("🚨 CUDA Error BEFORE `FORWARD::render`: %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__);
+	}
 
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
@@ -321,6 +482,12 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	err = cudaGetLastError(); 
+	if (err != cudaSuccess) {
+		printf("🚨 CUDA Error BEFORE `FORWARD::render`: %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__);
+	}
+
+	printf("RENDERING++++++++++++++++++++++++++++++++\n");
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
